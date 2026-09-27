@@ -9,6 +9,10 @@ import {
 } from '#client/routes/account-management-components.tsx'
 import { toast } from '#client/toast.ts'
 import {
+	accountConnectionsNewHref,
+	isAccountConnectionAgent,
+} from '#universal/account-connections.ts'
+import {
 	connectedAgentConnectionLabel,
 	groupConnectedAgents,
 } from '#universal/connected-mcp-agents.ts'
@@ -33,6 +37,12 @@ import {
 export function createAccountConnectedAgents(handle: Handle) {
 	let agents: Array<AccountConnectedAgentListItem> = []
 	const pendingRevokes = new Set<string>()
+	/**
+	 * After a revoke commits, ignore that clientId in later payloads until a
+	 * fetch omits it (or returns a newer connectedAt). Stops a prefetched /
+	 * in-flight GET from restoring the Connected mark on Add connection.
+	 */
+	const revokedAtByClientId = new Map<string, number>()
 	const revokeChecks = new Map<string, ReturnType<typeof createDoubleCheck>>()
 
 	function getRevokeCheck(clientId: string) {
@@ -43,12 +53,42 @@ export function createAccountConnectedAgents(handle: Handle) {
 		return created
 	}
 
+	function agentSurvivesRevokeFilter(agent: AccountConnectedAgentListItem) {
+		if (pendingRevokes.has(agent.clientId)) return false
+		const revokedAt = revokedAtByClientId.get(agent.clientId)
+		if (revokedAt == null) return true
+		if (!agent.connectedAt) return false
+		const connectedAtMs = Date.parse(agent.connectedAt)
+		return Number.isFinite(connectedAtMs) && connectedAtMs > revokedAt
+	}
+
 	function visibleAgents(next: Array<AccountConnectedAgentListItem>) {
-		if (pendingRevokes.size === 0) return next
-		return next.filter((agent) => !pendingRevokes.has(agent.clientId))
+		if (pendingRevokes.size === 0 && revokedAtByClientId.size === 0) {
+			return next
+		}
+		return next.filter(agentSurvivesRevokeFilter)
+	}
+
+	function clearStaleRevokeTombstones(
+		payloadAgents: ReadonlyArray<AccountConnectedAgentListItem>,
+	) {
+		for (const clientId of [...revokedAtByClientId.keys()]) {
+			const match = payloadAgents.find((agent) => agent.clientId === clientId)
+			if (!match) {
+				revokedAtByClientId.delete(clientId)
+				continue
+			}
+			const revokedAt = revokedAtByClientId.get(clientId)
+			if (revokedAt == null || !match.connectedAt) continue
+			const connectedAtMs = Date.parse(match.connectedAt)
+			if (Number.isFinite(connectedAtMs) && connectedAtMs > revokedAt) {
+				revokedAtByClientId.delete(clientId)
+			}
+		}
 	}
 
 	function applyPayload(payload: AccountConnectedAgentsLoaderData) {
+		clearStaleRevokeTombstones(payload.agents)
 		agents = visibleAgents(payload.agents)
 	}
 
@@ -82,11 +122,13 @@ export function createAccountConnectedAgents(handle: Handle) {
 				throw new Error(payload?.error || 'Unable to revoke this agent.')
 			}
 			pendingRevokes.delete(clientId)
+			revokedAtByClientId.set(clientId, Date.now())
 			// Keep the optimistic list. Replacing from this response can put
 			// back a sibling that already committed if that POST listed earlier.
 			toast.success('Agent disconnected.')
 		} catch (error) {
 			pendingRevokes.delete(clientId)
+			revokedAtByClientId.delete(clientId)
 			if (!agents.some((agent) => agent.clientId === clientId)) {
 				agents = [...agents, removed]
 			}
@@ -102,13 +144,17 @@ export function createAccountConnectedAgents(handle: Handle) {
 	return {
 		applyPayload,
 		revokeAgent,
+		/** Current list after optimistic revokes — Add connection marks use this. */
+		listAgents() {
+			return agents
+		},
 		/** `actions` renders under the list (the Connections list page puts Add connection there). */
 		render(options?: { actions?: RemixNode }) {
 			const groups = groupConnectedAgents(agents)
 			return (
 				<AccountManagementPanel
 					title="Connected agents"
-					description="AI hosts that have authorized against this Kody account. Same-named hosts are grouped. Labels are best-effort from the host name or redirect."
+					description="AI hosts that have authorized against this Kody account. Same-named hosts are grouped. Labels are best-effort from the host name or redirect. Already connected does not block reconnect — use View connect steps for a second login, new machine, or reinstall."
 					ariaLabel="Connected agents"
 				>
 					{groups.length > 0 ? (
@@ -126,6 +172,7 @@ export function createAccountConnectedAgents(handle: Handle) {
 									key={group.label}
 									data-testid="connected-agent-group"
 									data-agent-label={group.label}
+									mix={css(groupItemCss)}
 								>
 									<details mix={css(groupDetailsCss)}>
 										<summary mix={css(groupSummaryCss)}>
@@ -282,6 +329,17 @@ export function createAccountConnectedAgents(handle: Handle) {
 											})}
 										</ul>
 									</details>
+									{isAccountConnectionAgent(group.kind) ? (
+										<a
+											href={accountConnectionsNewHref(group.kind)}
+											data-testid="connected-agent-view-steps"
+											data-agent-kind={group.kind}
+											data-prevent-scroll-reset=""
+											mix={css(viewStepsLinkCss)}
+										>
+											View connect steps
+										</a>
+									) : null}
 								</li>
 							))}
 						</ul>
@@ -342,7 +400,16 @@ function ConnectedAgentMark(handle: Handle<{ icon: string | null }>) {
 	}
 }
 
+const groupItemCss = {
+	display: 'grid',
+	gridTemplateColumns: 'minmax(0, 1fr) auto',
+	alignItems: 'start',
+	gap: spacing.sm,
+	columnGap: spacing.md,
+}
+
 const groupDetailsCss = {
+	minWidth: 0,
 	'&[open] > summary': { marginBottom: spacing.sm },
 }
 
@@ -352,6 +419,18 @@ const groupSummaryCss = {
 	gap: spacing.sm,
 	cursor: 'pointer',
 	flexWrap: 'wrap' as const,
+}
+
+const viewStepsLinkCss = {
+	color: colors.primaryText,
+	fontSize: typography.fontSize.sm,
+	fontWeight: typography.fontWeight.medium,
+	textDecoration: 'none',
+	whiteSpace: 'nowrap' as const,
+	paddingBlock: '0.2rem',
+	'&:hover': {
+		color: colors.text,
+	},
 }
 
 const connectionRowCss = {
