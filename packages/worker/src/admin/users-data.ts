@@ -32,6 +32,11 @@ import {
 	emailVerificationStallCutoffIso,
 	emailVerificationStallSqlConditions,
 } from '#worker/identity/email-verification-stall.ts'
+import { forgiveCreditUsageBeforeUnlock } from '#worker/billing/credit-wallet.ts'
+import {
+	userEntitlementColumnsSql,
+	type UserEntitlementRow,
+} from '#worker/entitlements/service.ts'
 import { normalizeEmail } from '#worker/identity/normalize-email.ts'
 import {
 	createStableUserIdFromEmail,
@@ -360,12 +365,13 @@ export async function loadAdminUserByTarget(
 /**
  * Set the manual entitlement grant on one user account (`users.plan`).
  * Nullish inputs map to `free`, the normal default; writers never persist
- * NULL. Stripe subscriptions stay on `users.stripe_plan`. Returns the
- * updated account metadata record, or null when no user matches the target.
+ * NULL. Stripe subscriptions stay on `users.stripe_plan`. A change that unlocks
+ * an admin-eligible credit wallet forgives locked-period usage first. Returns
+ * the updated account metadata record, or null when no user matches the target.
  */
 export async function updateAdminUserPlan(
 	db: D1Database,
-	input: AdminUserTarget & { plan: PlanName | null },
+	input: AdminUserTarget & { plan: PlanName | null; now?: Date },
 ): Promise<AdminUserListItem | null> {
 	const existing = await loadAdminUserByTarget(db, input)
 	if (!existing) return null
@@ -375,6 +381,7 @@ export async function updateAdminUserPlan(
 	)
 	if (!existingRow) return null
 
+	const now = input.now ?? new Date()
 	const nextPlan = resolvePlanWrite(input.plan)
 	const stripePlan = parseStripePlanName(existingRow.stripe_plan)
 	const nextLadder = resolveEntitlementLadderAfterPaidAccessChange({
@@ -383,11 +390,28 @@ export async function updateAdminUserPlan(
 		previousStripePlan: stripePlan,
 		nextStripePlan: stripePlan,
 	})
+	const entitlementRow = await db
+		.prepare(`SELECT ${userEntitlementColumnsSql()} FROM users WHERE id = ?`)
+		.bind(existingRow.id)
+		.first<UserEntitlementRow>()
+	if (entitlementRow) {
+		await forgiveCreditUsageBeforeUnlock({
+			db,
+			userId: existing.stableUserId,
+			current: entitlementRow,
+			next: {
+				...entitlementRow,
+				plan: nextPlan,
+				entitlement_ladder: nextLadder,
+			},
+			now,
+		})
+	}
 	await db
 		.prepare(
 			`UPDATE users SET plan = ?, entitlement_ladder = ?, updated_at = ? WHERE id = ?`,
 		)
-		.bind(nextPlan, nextLadder, utcSqliteTimestamp(), existingRow.id)
+		.bind(nextPlan, nextLadder, utcSqliteTimestamp(now), existingRow.id)
 		.run()
 
 	return loadAdminUserByTarget(db, { stableUserId: existing.stableUserId })

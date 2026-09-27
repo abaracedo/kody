@@ -214,17 +214,22 @@ which equals the retired public Standard table. Retired Standard ($12/$120) and
 Pro ($49/$480) subscribers keep their plan and table until they change plan
 (`retiredStandardPriceIds` / `retiredProPriceIds`); checkout only sells Pro.
 
-**Eligibility keys off the Stripe price.** `resolveSubscriptionPlan` sets
-`creditsEligible` when the granting subscription uses a configured Pro price,
-and every Stripe refresh writes it to `users.stripe_credits_eligible`
-(`0069-prepaid-credits.sql`). That separates Pro from retired Standard at the
-same $12. `getUserEntitlement` returns `creditWallet`
-(`resolveCreditWalletState`): `none` unless the effective plan is `pro` and the
-account is credits-eligible (the purchasable Pro Stripe price only —
-`users.stripe_credits_eligible`), then `funded` when
-`credit_wallets.balance_micro_usd > 0` and `empty` otherwise. Free, retired
-Standard/Pro, gift/referral Pro overlays, manual grants, and `max` are always
-`none`; an admin grant to them only holds a balance.
+**Eligibility keys off the Stripe price or an admin decision.**
+`resolveSubscriptionPlan` sets `creditsEligible` when the granting subscription
+uses a configured Pro price, and every Stripe refresh writes it to
+`users.stripe_credits_eligible` (`0069-prepaid-credits.sql`). That separates Pro
+from retired Standard at the same $12. Because Stripe refreshes overwrite that
+column, admins set the separate `users.admin_credits_eligible`
+(`0070-admin-credits-eligible.sql`) with `adminCreditEligibilitySet`; Stripe
+never writes it. `hasStoredCreditsEligibility` ORs the two. `getUserEntitlement`
+returns `creditWallet` (`resolveCreditWalletState`): `none` unless the effective
+plan is `pro` and the account is eligible (the purchasable Pro price or admin
+eligibility), then `funded` when `credit_wallets.balance_micro_usd > 0` and
+`empty` otherwise. Free, retired Standard, and `max` are always `none`. Retired
+Pro, gift/referral Pro overlays, and manual `pro` grants are `none` unless
+admin-eligible. An admin grant to a `none` account only holds a balance. Buying
+credits and auto-refill still require the purchasable Pro subscription
+(`isPayingForCreditsPro`).
 
 **Unlock.** `funded` multiplies the rate/compute limits in
 `creditsUnlockedLimitFields` (execute, outbound fetches, job runs, and
@@ -283,6 +288,18 @@ the calling admin, without a Stripe charge. Each grant writes a ledger row with
 `granted_by_user_id`, amount, recipient, time, and optional note, plus an admin
 audit event. `adminCreditWalletGet` and `GET /admin/users/credits.json` read the
 balance and recent ledger.
+
+**Admin eligibility.** To give an account the wallet without a Stripe checkout,
+set its manual plan to `pro` (`adminUserUpdate`), fund it (`adminCreditGrant`),
+and call `adminCreditEligibilitySet` with the target (`stableUserId`, `email`,
+or `username`), `creditsEligible: true`, and an optional `note`. It writes an
+admin audit event (target, new and previous value, note), never creates Stripe
+customers or subscriptions. The steps work in either order: whichever write
+(eligibility or the manual plan) unlocks the wallet first calls
+`forgiveCreditUsageBeforeUnlock`, which advances debit progress to the unlocked
+include before the write, so the unlock never charges for locked-period usage.
+`creditsEligible: false` clears it; the balance stays on hold. Enforcement picks
+the change up within the 60s entitlement cache.
 
 ## Compute rate limits
 

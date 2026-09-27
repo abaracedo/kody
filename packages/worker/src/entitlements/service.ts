@@ -55,6 +55,7 @@ export const userEntitlementColumns = [
 	'stripe_plan',
 	'entitlement_ladder',
 	'stripe_credits_eligible',
+	'admin_credits_eligible',
 	'second_agent_standard_gift_expires_at',
 	'referral_standard_credit_expires_at',
 ] as const
@@ -70,16 +71,37 @@ export type UserEntitlementRow = {
 	entitlement_ladder: string | null
 	/** Absent on rows selected before the credits migration (fixtures). */
 	stripe_credits_eligible?: number | null
+	/** Absent on rows selected before the admin eligibility migration (fixtures). */
+	admin_credits_eligible?: number | null
 	second_agent_standard_gift_expires_at: string | null
 	referral_standard_credit_expires_at: string | null
 }
 
 /**
+ * Stored credit eligibility, independent of the effective plan: the
+ * purchasable Pro Stripe price (`stripe_credits_eligible`, rewritten by every
+ * Stripe refresh) or an admin decision (`admin_credits_eligible`, never
+ * touched by Stripe). Only an effective `pro` plan uses it.
+ */
+export function hasStoredCreditsEligibility(
+	row: Pick<
+		UserEntitlementRow,
+		'stripe_credits_eligible' | 'admin_credits_eligible'
+	>,
+): boolean {
+	return (
+		Number(row.stripe_credits_eligible) === 1 ||
+		Number(row.admin_credits_eligible) === 1
+	)
+}
+
+/**
  * Effective plan, ladder, and credit eligibility for a `users` row, without
- * the wallet balance. Eligible means the purchasable Pro Stripe price only
- * (`users.stripe_credits_eligible`). Second-agent / referral Pro overlays
- * raise Free to the retired Pro table without a credit wallet, so they keep
- * pre-credits Pro ceilings. A manual `max` grant outranks both.
+ * the wallet balance. Eligible means an effective `pro` with the purchasable
+ * Pro Stripe price or admin eligibility ({@link hasStoredCreditsEligibility}).
+ * Second-agent / referral Pro overlays raise Free to the retired Pro table
+ * without a credit wallet, so they keep pre-credits Pro ceilings. A manual
+ * `max` grant outranks all of them.
  */
 export function resolveUserPlanFromRow(
 	row: UserEntitlementRow,
@@ -101,8 +123,7 @@ export function resolveUserPlanFromRow(
 	return {
 		plan,
 		ladder: parseEntitlementLadder(row.entitlement_ladder),
-		creditsEligible:
-			plan === 'pro' && Number(row.stripe_credits_eligible) === 1,
+		creditsEligible: plan === 'pro' && hasStoredCreditsEligibility(row),
 	}
 }
 
@@ -144,7 +165,11 @@ export async function resolveBaseUserEntitlement(input: {
 	stableUserId: string
 	row: Pick<
 		UserEntitlementRow,
-		'plan' | 'stripe_plan' | 'entitlement_ladder' | 'stripe_credits_eligible'
+		| 'plan'
+		| 'stripe_plan'
+		| 'entitlement_ladder'
+		| 'stripe_credits_eligible'
+		| 'admin_credits_eligible'
 	>
 }): Promise<UserEntitlement> {
 	const plan = resolveEffectivePlan(
@@ -152,7 +177,7 @@ export async function resolveBaseUserEntitlement(input: {
 		input.row.stripe_plan,
 	)
 	const creditsEligible =
-		plan === 'pro' && Number(input.row.stripe_credits_eligible) === 1
+		plan === 'pro' && hasStoredCreditsEligibility(input.row)
 	return {
 		plan,
 		ladder: parseEntitlementLadder(input.row.entitlement_ladder),
