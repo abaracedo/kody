@@ -75,7 +75,7 @@ test('launch signals aggregate paid MRR, funnels, activity, and overlays without
 		stableUserId: 'user-paid-monthly',
 		plan: 'free',
 		stripePlan: 'standard',
-		stripePriceId: 'price_standard',
+		stripePriceId: 'price_1U3sg6LAQpAnsYszGeL2nc8O',
 		emailVerifiedAt: '2026-08-02T00:00:00.000Z',
 		firstMcpConnectedAt: '2026-08-03T00:00:00.000Z',
 		firstSearchAt: '2026-08-03T01:00:00.000Z',
@@ -90,7 +90,7 @@ test('launch signals aggregate paid MRR, funnels, activity, and overlays without
 		stableUserId: 'user-paid-yearly',
 		plan: 'pro',
 		stripePlan: 'pro',
-		stripePriceId: 'price_pro_yearly',
+		stripePriceId: 'price_1UChg2LAQpAnsYszKAFCR778',
 		emailVerifiedAt: '2026-09-10T08:00:00.000Z',
 		firstMcpConnectedAt: '2026-09-10T09:00:00.000Z',
 		mcpClientName: 'Claude Code',
@@ -134,8 +134,6 @@ test('launch signals aggregate paid MRR, funnels, activity, and overlays without
 	const signals = await loadAdminLaunchSignals({
 		db,
 		env: {
-			STRIPE_STANDARD_PRICE_ID: 'price_standard',
-			STRIPE_STANDARD_YEARLY_PRICE_ID: 'price_standard_yearly',
 			STRIPE_PRO_PRICE_ID: 'price_pro',
 			STRIPE_PRO_YEARLY_PRICE_ID: 'price_pro_yearly',
 		},
@@ -168,10 +166,10 @@ test('launch signals aggregate paid MRR, funnels, activity, and overlays without
 		{ plan: 'standard', count: 1 },
 	])
 	expect(signals.effectivePlans).toEqual([
-		{ plan: 'standard', count: 2 },
-		{ plan: 'pro', count: 1 },
+		{ plan: 'pro', count: 2 },
+		{ plan: 'standard', count: 1 },
 	])
-	expect(signals.overlayStandard).toBe(1)
+	expect(signals.overlayPro).toBe(1)
 	expect(signals.entitlementLadders).toEqual({ public: 2, legacy: 1 })
 	expect(signals.paidEntitlementLadders).toEqual({ public: 1, legacy: 1 })
 	expect(signals.activeUsers).toEqual({
@@ -214,8 +212,6 @@ test('active windows count last_active_at UTC days, not a rolling ISO-hour cutof
 	const signals = await loadAdminLaunchSignals({
 		db,
 		env: {
-			STRIPE_STANDARD_PRICE_ID: 'price_standard',
-			STRIPE_STANDARD_YEARLY_PRICE_ID: 'price_standard_yearly',
 			STRIPE_PRO_PRICE_ID: 'price_pro',
 			STRIPE_PRO_YEARLY_PRICE_ID: 'price_pro_yearly',
 		},

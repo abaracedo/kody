@@ -4,13 +4,7 @@ import {
 	fleetDynamicWorkerCostAlertUsd,
 	toAdminDynamicWorkerCost,
 } from '#universal/dynamic-worker-cost.ts'
-import {
-	parseEntitlementLadder,
-	parseStoredPlanName,
-	resolveEffectivePlan,
-	type EntitlementLadder,
-	type PlanName,
-} from '#universal/plans.ts'
+import { type EntitlementLadder, type PlanName } from '#universal/plans.ts'
 import { observeOnlyUsageEventTypes } from '#universal/usage-event-types.ts'
 import {
 	adminFleetCostVsPayDisplayLimit,
@@ -21,6 +15,7 @@ import {
 import { resolveStripePriceCatalog } from '#worker/billing/stripe-price-catalog.ts'
 import { adminUsageMetrics } from '#worker/admin/user-usage-data.ts'
 import { readAdminEntitlementConsumption } from '#worker/admin/entitlement-consumption.ts'
+import { resolveBaseUserEntitlement } from '#worker/entitlements/service.ts'
 import {
 	type AdminInsightsDurationConsumer,
 	type AdminInsightsDynamicWorkerCost,
@@ -75,6 +70,7 @@ type ActiveUserRow = {
 	plan: string
 	stripe_plan: string | null
 	entitlement_ladder: string | null
+	stripe_credits_eligible?: number | null
 	event_count: number
 }
 
@@ -192,16 +188,17 @@ export async function loadFleetEntitlementCrossingSnapshots(input: {
 		activeUsers,
 		entitlementSweepConcurrency,
 		async (user) => {
-			const plan = resolveEffectivePlan(
-				parseStoredPlanName(user.plan),
-				user.stripe_plan,
-			)
-			const ladder = parseEntitlementLadder(user.entitlement_ladder)
+			const { plan, ladder, creditWallet } = await resolveBaseUserEntitlement({
+				db: input.env.APP_DB,
+				stableUserId: user.stable_user_id,
+				row: user,
+			})
 			const consumption = await readAdminEntitlementConsumption({
 				env: input.env,
 				usageUserId: user.stable_user_id,
 				plan,
 				ladder,
+				creditWallet,
 				now: input.now,
 			})
 			snapshots.push({
@@ -478,15 +475,18 @@ async function buildEntitlementPressurePanel(input: {
 		activeUsers,
 		entitlementSweepConcurrency,
 		async (user) => {
-			const plan = toAdminPlanName(
-				resolveEffectivePlan(parseStoredPlanName(user.plan), user.stripe_plan),
-			)
-			const ladder = parseEntitlementLadder(user.entitlement_ladder)
+			const entitlement = await resolveBaseUserEntitlement({
+				db: input.env.APP_DB,
+				stableUserId: user.stable_user_id,
+				row: user,
+			})
+			const plan = toAdminPlanName(entitlement.plan)
 			const consumption = await readAdminEntitlementConsumption({
 				env: input.env,
 				usageUserId: user.stable_user_id,
 				plan,
-				ladder,
+				ladder: entitlement.ladder,
+				creditWallet: entitlement.creditWallet,
 				now: input.now,
 			})
 			const pressuredResources = consumption
@@ -521,13 +521,13 @@ async function listActiveUsersForEntitlementSweep(
 ): Promise<Array<ActiveUserRow>> {
 	const rows = await db
 		.prepare(
-			`SELECT u.stable_user_id, u.username, u.plan, u.stripe_plan, u.entitlement_ladder, SUM(r.event_count) AS event_count
+			`SELECT u.stable_user_id, u.username, u.plan, u.stripe_plan, u.entitlement_ladder, u.stripe_credits_eligible, SUM(r.event_count) AS event_count
 			 FROM usage_rollups r
 			 INNER JOIN users u ON u.stable_user_id = r.user_id
 			 WHERE r.month = ?
 				AND r.metric NOT IN (${observeOnlyMetricPlaceholders})
 				AND u.deleting_at IS NULL
-			 GROUP BY u.stable_user_id, u.username, u.plan, u.stripe_plan, u.entitlement_ladder
+			 GROUP BY u.stable_user_id, u.username, u.plan, u.stripe_plan, u.entitlement_ladder, u.stripe_credits_eligible
 			 ORDER BY event_count DESC
 			 LIMIT ?`,
 		)

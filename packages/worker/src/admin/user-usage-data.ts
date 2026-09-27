@@ -11,13 +11,9 @@ import {
 	type AdminUsageRollup,
 	type AdminUserUsageLoaderData,
 } from '#universal/loader-data.ts'
-import {
-	parseEntitlementLadder,
-	parseStoredPlanName,
-	resolveEffectivePlan,
-} from '#universal/plans.ts'
 import { toAdminCostVsPay } from '#worker/admin/cost-vs-pay.ts'
 import { readAdminEntitlementConsumption } from '#worker/admin/entitlement-consumption.ts'
+import { resolveBaseUserEntitlement } from '#worker/entitlements/service.ts'
 import { resolveStripePriceCatalog } from '#worker/billing/stripe-price-catalog.ts'
 import { createKvCachifiedCache } from '#worker/kv-cachified.ts'
 import { resolveUserStableId } from '#worker/user-id.ts'
@@ -53,6 +49,7 @@ type AdminUserUsageUserRow = {
 	stripe_plan: string | null
 	stripe_price_id: string | null
 	entitlement_ladder: string | null
+	stripe_credits_eligible: number | null
 	stable_user_id: string
 }
 
@@ -79,18 +76,19 @@ export async function loadAdminUserUsageData(
 	now: Date = new Date(),
 ): Promise<AdminUserUsageLoaderData | null> {
 	const row = await env.APP_DB.prepare(
-		`SELECT id, username, email, plan, stripe_plan, stripe_price_id, entitlement_ladder, stable_user_id FROM users WHERE stable_user_id = ?`,
+		`SELECT id, username, email, plan, stripe_plan, stripe_price_id, entitlement_ladder, stripe_credits_eligible, stable_user_id FROM users WHERE stable_user_id = ?`,
 	)
 		.bind(stableUserId)
 		.first<AdminUserUsageUserRow>()
 	if (!row) return null
 
-	const plan = resolveEffectivePlan(
-		parseStoredPlanName(row.plan),
-		row.stripe_plan,
-	)
-	const ladder = parseEntitlementLadder(row.entitlement_ladder)
 	const usageUserId = resolveUserStableId(row)
+	const entitlement = await resolveBaseUserEntitlement({
+		db: env.APP_DB,
+		stableUserId: usageUserId,
+		row,
+	})
+	const plan = entitlement.plan
 	const currentMonth = utcMonthKey(now)
 	const today = utcDayKey(now)
 	// Fall through to direct D1 queries when KV is unavailable (some tests
@@ -111,7 +109,8 @@ export async function loadAdminUserUsageData(
 				env,
 				usageUserId,
 				plan,
-				ladder,
+				ladder: entitlement.ladder,
+				creditWallet: entitlement.creditWallet,
 				now,
 			}),
 			userHasAdminRole(env.APP_DB, usageUserId),

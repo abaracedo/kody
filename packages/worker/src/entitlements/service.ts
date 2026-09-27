@@ -4,6 +4,9 @@ import {
 	isWeeklyComputeWindowResource,
 	parseEntitlementLadder,
 	parseStoredPlanName,
+	parseStripePlanName,
+	resolveCreditWalletState,
+	resolveEffectivePlan,
 	resolvePlanLimit,
 	resolveWeeklyPlanLimit,
 	type EntitlementResource,
@@ -11,7 +14,7 @@ import {
 	type UserEntitlement,
 } from '#universal/plans.ts'
 import { laterIsoTimestamp } from '#universal/referral-program.ts'
-import { resolveEffectivePlanWithSecondAgentGift } from '#universal/second-agent-standard-gift.ts'
+import { resolvePlanOverlay } from '#universal/second-agent-standard-gift.ts'
 import { countInternalUserEmailMessages } from '#worker/email/mailbox-internal-read.ts'
 import { jobsData } from '#worker/jobs/jobs-data.ts'
 import { type RepoSessionIndexEnv } from '#worker/repo/repo-session-index-client.ts'
@@ -39,13 +42,167 @@ const stableUserIdPattern = /^[a-f0-9]{64}$/i
 const publicFreeEntitlement: UserEntitlement = {
 	plan: 'free',
 	ladder: 'public',
+	creditWallet: 'none',
 }
 
 /**
- * Resolve the effective plan and entitlement ladder for a user. Missing
- * userId, invalid stable ids, and no matching row resolve to public `free`
- * without warning. Stored plan values go through strict
- * {@link parseStoredPlanName}; the ladder goes through
+ * `users` columns every entitlement resolution reads. Select these (with a
+ * `u.` prefix via {@link userEntitlementColumnsSql}) wherever a sweep
+ * already has the row, then call {@link resolveUserEntitlementFromRow}.
+ */
+export const userEntitlementColumns = [
+	'plan',
+	'stripe_plan',
+	'entitlement_ladder',
+	'stripe_credits_eligible',
+	'second_agent_standard_gift_expires_at',
+	'referral_standard_credit_expires_at',
+] as const
+
+export function userEntitlementColumnsSql(alias?: string) {
+	const prefix = alias ? `${alias}.` : ''
+	return userEntitlementColumns.map((column) => `${prefix}${column}`).join(', ')
+}
+
+export type UserEntitlementRow = {
+	plan: string
+	stripe_plan: string | null
+	entitlement_ladder: string | null
+	/** Absent on rows selected before the credits migration (fixtures). */
+	stripe_credits_eligible?: number | null
+	second_agent_standard_gift_expires_at: string | null
+	referral_standard_credit_expires_at: string | null
+}
+
+/**
+ * Effective plan, ladder, and credit eligibility for a `users` row, without
+ * the wallet balance. Eligible means the purchasable Pro: its Stripe price,
+ * or the second-agent / referral Pro overlay on Free. A manual `max` grant
+ * outranks both.
+ */
+export function resolveUserPlanFromRow(
+	row: UserEntitlementRow,
+	now?: Date,
+): {
+	plan: PlanName
+	ladder: UserEntitlement['ladder']
+	creditsEligible: boolean
+} {
+	const { plan, isProOverlay } = resolvePlanOverlay(
+		parseStoredPlanName(row.plan),
+		row.stripe_plan,
+		laterIsoTimestamp(
+			row.second_agent_standard_gift_expires_at,
+			row.referral_standard_credit_expires_at,
+		),
+		now,
+	)
+	return {
+		plan,
+		ladder: parseEntitlementLadder(row.entitlement_ladder),
+		creditsEligible:
+			plan === 'pro' &&
+			(isProOverlay || Number(row.stripe_credits_eligible) === 1),
+	}
+}
+
+/**
+ * Subscribed on the purchasable Pro Stripe price (not a gift or referral
+ * overlay). Only these accounts can buy credits or use auto-refill.
+ */
+export function isPayingForCreditsPro(row: UserEntitlementRow): boolean {
+	return (
+		parseStripePlanName(row.stripe_plan) === 'pro' &&
+		Number(row.stripe_credits_eligible) === 1
+	)
+}
+
+/**
+ * Read the prepaid credit balance (micro-USD). Missing wallet rows are a
+ * zero balance.
+ */
+export async function readCreditWalletBalanceMicroUsd(
+	db: D1Database,
+	stableUserId: string,
+): Promise<number> {
+	const row = await db
+		.prepare(`SELECT balance_micro_usd FROM credit_wallets WHERE user_id = ?`)
+		.bind(stableUserId)
+		.first<{ balance_micro_usd: number }>()
+	return Number(row?.balance_micro_usd ?? 0)
+}
+
+/**
+ * Entitlement from the manual grant and Stripe only, without gift or
+ * referral overlays (inbound email and admin sweeps score the base plan).
+ * It resolves the plan itself so an overlay plan can never be paired with
+ * Stripe-only eligibility. Overlay-aware callers use
+ * {@link resolveUserEntitlementFromRow}.
+ */
+export async function resolveBaseUserEntitlement(input: {
+	db: D1Database
+	stableUserId: string
+	row: Pick<
+		UserEntitlementRow,
+		'plan' | 'stripe_plan' | 'entitlement_ladder' | 'stripe_credits_eligible'
+	>
+}): Promise<UserEntitlement> {
+	const plan = resolveEffectivePlan(
+		parseStoredPlanName(input.row.plan),
+		input.row.stripe_plan,
+	)
+	const creditsEligible =
+		plan === 'pro' && Number(input.row.stripe_credits_eligible) === 1
+	return {
+		plan,
+		ladder: parseEntitlementLadder(input.row.entitlement_ladder),
+		creditWallet: creditsEligible
+			? resolveCreditWalletState({
+					plan,
+					creditsEligible,
+					balanceMicroUsd: await readCreditWalletBalanceMicroUsd(
+						input.db,
+						input.stableUserId,
+					),
+				})
+			: 'none',
+	}
+}
+
+/**
+ * Full {@link UserEntitlement} for a `users` row. Reads the wallet balance
+ * only for wallet-eligible Pro accounts, so every other account costs no
+ * extra query.
+ */
+export async function resolveUserEntitlementFromRow(input: {
+	db: D1Database
+	stableUserId: string
+	row: UserEntitlementRow
+	now?: Date
+}): Promise<UserEntitlement> {
+	const { plan, ladder, creditsEligible } = resolveUserPlanFromRow(
+		input.row,
+		input.now,
+	)
+	const balanceMicroUsd = creditsEligible
+		? await readCreditWalletBalanceMicroUsd(input.db, input.stableUserId)
+		: 0
+	return {
+		plan,
+		ladder,
+		creditWallet: resolveCreditWalletState({
+			plan,
+			creditsEligible,
+			balanceMicroUsd,
+		}),
+	}
+}
+
+/**
+ * Resolve the effective plan, entitlement ladder, and credit wallet state
+ * for a user. Missing userId, invalid stable ids, and no matching row
+ * resolve to public `free` without warning. Stored plan values go through
+ * strict {@link parseStoredPlanName}; the ladder goes through
  * {@link parseEntitlementLadder}.
  *
  * The MCP `userId` is the account's stored `users.stable_user_id`. Lookup
@@ -59,7 +216,8 @@ const publicFreeEntitlement: UserEntitlement = {
  * subscription plan, then a public Standard overlay when the later of the
  * second-agent gift and stacked referral credit is still active and the
  * base plan is still free. `legacy` ceilings apply only while that marker
- * stays set and paid access remains continuous.
+ * stays set and paid access remains continuous. The credit wallet is
+ * `funded` only for the purchasable Pro with a positive balance.
  */
 export async function getUserEntitlement(
 	db: D1Database,
@@ -68,33 +226,21 @@ export async function getUserEntitlement(
 	const email = input.email?.trim().toLowerCase()
 	if (!input.userId) return publicFreeEntitlement
 	if (!stableUserIdPattern.test(input.userId)) return publicFreeEntitlement
+	const columns = userEntitlementColumnsSql()
 	const row = await db
 		.prepare(
 			email
-				? `SELECT plan, stripe_plan, entitlement_ladder, second_agent_standard_gift_expires_at, referral_standard_credit_expires_at FROM users WHERE email = ? AND stable_user_id = ?`
-				: `SELECT plan, stripe_plan, entitlement_ladder, second_agent_standard_gift_expires_at, referral_standard_credit_expires_at FROM users WHERE stable_user_id = ?`,
+				? `SELECT ${columns} FROM users WHERE email = ? AND stable_user_id = ?`
+				: `SELECT ${columns} FROM users WHERE stable_user_id = ?`,
 		)
 		.bind(...(email ? [email, input.userId] : [input.userId]))
-		.first<{
-			plan: string
-			stripe_plan: string | null
-			entitlement_ladder: string | null
-			second_agent_standard_gift_expires_at: string | null
-			referral_standard_credit_expires_at: string | null
-		}>()
+		.first<UserEntitlementRow>()
 	if (!row) return publicFreeEntitlement
-	const plan = resolveEffectivePlanWithSecondAgentGift(
-		parseStoredPlanName(row.plan),
-		row.stripe_plan,
-		laterIsoTimestamp(
-			row.second_agent_standard_gift_expires_at,
-			row.referral_standard_credit_expires_at,
-		),
-	)
-	return {
-		plan,
-		ladder: parseEntitlementLadder(row.entitlement_ladder),
-	}
+	return await resolveUserEntitlementFromRow({
+		db,
+		stableUserId: input.userId,
+		row,
+	})
 }
 
 /**
@@ -956,7 +1102,12 @@ export async function assertWithinStorageBytesEntitlement(input: {
 		email: input.email,
 	})
 	const plan = entitlement.plan
-	const limit = resolvePlanLimit(plan, 'storage_bytes', entitlement.ladder)
+	const limit = resolvePlanLimit(
+		plan,
+		'storage_bytes',
+		entitlement.ladder,
+		entitlement.creditWallet,
+	)
 	const requested = Math.max(0, input.requested ?? 1)
 	const updatedAt = new Date().toISOString()
 
@@ -982,7 +1133,11 @@ export async function assertWithinStorageBytesEntitlement(input: {
 					plan,
 					limit,
 					current,
-					upgradeHint: buildEntitlementUpgradeHint('storage_bytes', plan),
+					upgradeHint: buildEntitlementUpgradeHint(
+						'storage_bytes',
+						plan,
+						entitlement.creditWallet,
+					),
 				})
 			}
 			// Real user with no DO row: zero-initialize, then retry. The
@@ -1000,7 +1155,11 @@ export async function assertWithinStorageBytesEntitlement(input: {
 				plan,
 				limit,
 				current: result.bytes,
-				upgradeHint: buildEntitlementUpgradeHint('storage_bytes', plan),
+				upgradeHint: buildEntitlementUpgradeHint(
+					'storage_bytes',
+					plan,
+					entitlement.creditWallet,
+				),
 			})
 		}
 
@@ -1047,7 +1206,12 @@ export async function assertWithinEntitlement(
 		email: input.email,
 	})
 	const plan = entitlement.plan
-	const limit = resolvePlanLimit(plan, input.resource, entitlement.ladder)
+	const limit = resolvePlanLimit(
+		plan,
+		input.resource,
+		entitlement.ladder,
+		entitlement.creditWallet,
+	)
 	const now = input.now ?? new Date()
 	const requested = input.requested ?? 1
 	const current = input.getCurrent
@@ -1064,7 +1228,11 @@ export async function assertWithinEntitlement(
 			plan,
 			limit,
 			current,
-			upgradeHint: buildEntitlementUpgradeHint(input.resource, plan),
+			upgradeHint: buildEntitlementUpgradeHint(
+				input.resource,
+				plan,
+				entitlement.creditWallet,
+			),
 		})
 	}
 }
@@ -1100,9 +1268,19 @@ export async function consumeDailyEntitlement(
 		email: input.email,
 	})
 	const plan = entitlement.plan
-	const limit = resolvePlanLimit(plan, resource, entitlement.ladder)
+	const limit = resolvePlanLimit(
+		plan,
+		resource,
+		entitlement.ladder,
+		entitlement.creditWallet,
+	)
 	const weekLimit = isWeeklyComputeWindowResource(resource)
-		? resolveWeeklyPlanLimit(plan, resource, entitlement.ladder)
+		? resolveWeeklyPlanLimit(
+				plan,
+				resource,
+				entitlement.ladder,
+				entitlement.creditWallet,
+			)
 		: null
 	const weekStart = weekLimit === null ? undefined : utcWeekStart(now)
 	const meter = userMeterRpc({ env: input.env, userId: input.userId })
@@ -1138,7 +1316,11 @@ export async function consumeDailyEntitlement(
 				limit: weekLimit,
 				current: result.weekCount ?? 0,
 				window: 'week',
-				upgradeHint: buildEntitlementUpgradeHint(resource, plan),
+				upgradeHint: buildEntitlementUpgradeHint(
+					resource,
+					plan,
+					entitlement.creditWallet,
+				),
 			})
 		}
 		throw new EntitlementLimitError({
@@ -1146,7 +1328,11 @@ export async function consumeDailyEntitlement(
 			plan,
 			limit,
 			current: result.count,
-			upgradeHint: buildEntitlementUpgradeHint(resource, plan),
+			upgradeHint: buildEntitlementUpgradeHint(
+				resource,
+				plan,
+				entitlement.creditWallet,
+			),
 		})
 	}
 }
