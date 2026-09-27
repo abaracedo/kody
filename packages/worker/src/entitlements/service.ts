@@ -1,6 +1,12 @@
-import { utcDayKey, utcWeekStart } from '@kody-internal/shared/date-keys.ts'
-import { type JobsStore } from '@kody-internal/shared/jobs/store.ts'
 import {
+	utcDayKey,
+	utcMonthKey,
+	utcWeekStart,
+} from '@kody-internal/shared/date-keys.ts'
+import { type JobsStore } from '@kody-internal/shared/jobs/store.ts'
+import { resolvePastIncludeStop } from '#universal/compute-overage.ts'
+import {
+	isPastIncludeStopResource,
 	isWeeklyComputeWindowResource,
 	parseEntitlementLadder,
 	parseStoredPlanName,
@@ -21,7 +27,15 @@ import { type RepoSessionIndexEnv } from '#worker/repo/repo-session-index-client
 import { countActiveRepoSessions } from '#worker/repo/repo-sessions.ts'
 import { countActiveWorkflowProjections } from '#worker/run-records/service.ts'
 import { normalizeStableUserId } from '#worker/user-id.ts'
-import { EntitlementLimitError, buildEntitlementUpgradeHint } from './errors.ts'
+import {
+	readMonthlyComputeUsage,
+	type MonthlyComputeUsage,
+} from '#worker/billing/compute-overage-usage.ts'
+import {
+	ComputeOverageLimitError,
+	EntitlementLimitError,
+	buildEntitlementUpgradeHint,
+} from './errors.ts'
 import {
 	isDailyEntitlementResource,
 	type DailyEntitlementResource,
@@ -1293,6 +1307,15 @@ export async function consumeDailyEntitlement(
 		userId: input.userId,
 		email: input.email,
 	})
+	// Before the counter so a stopped attempt does not spend daily quota.
+	if (isPastIncludeStopResource(resource)) {
+		await assertWithinPastIncludeCredits({
+			db: input.db,
+			userId: input.userId,
+			entitlement,
+			now,
+		})
+	}
 	const plan = entitlement.plan
 	const limit = resolvePlanLimit(
 		plan,
@@ -1361,6 +1384,80 @@ export async function consumeDailyEntitlement(
 			),
 		})
 	}
+}
+
+const cachedMonthlyComputeUsage =
+	createEntitlementLookupCache<MonthlyComputeUsage>()
+
+/**
+ * Include → credits → stop for purchasable Pro: once this UTC month's
+ * Worker compute or Rows read include is used up and the wallet is empty,
+ * new compute stops until credits are added. Funded wallets pay past the
+ * include; wallet-less plans keep their hard caps. `usage_rollups` refresh
+ * hourly and the read shares the entitlement cache TTL, so the stop trails
+ * usage by about an hour; a later top-up forgives that overshoot instead of
+ * charging it. A stop is confirmed against an uncached entitlement so a
+ * top-up in another isolate resumes work right away.
+ */
+async function assertWithinPastIncludeCredits(input: {
+	db: D1Database
+	userId: string
+	entitlement: UserEntitlement
+	now: Date
+}) {
+	if (input.entitlement.creditWallet !== 'empty') return
+	const month = utcMonthKey(input.now)
+	const usage = await cachedMonthlyComputeUsage.getOrCreate(
+		input.db,
+		`${input.userId}\n${month}`,
+		async () =>
+			await readMonthlyComputeUsage({
+				db: input.db,
+				stableUserId: input.userId,
+				month,
+			}),
+	)
+	const stop = resolvePastIncludeStop({
+		plan: input.entitlement.plan,
+		ladder: input.entitlement.ladder,
+		creditWallet: input.entitlement.creditWallet,
+		...usage,
+	})
+	if (!stop) return
+	const fresh = await getUserEntitlement(input.db, {
+		userId: input.userId,
+		email: null,
+	})
+	if (fresh.creditWallet !== 'empty') return
+	throw new ComputeOverageLimitError({
+		resource: stop.resource,
+		plan: fresh.plan,
+		limit: stop.limit,
+		current: stop.current,
+		creditsStatus: 'add_credits',
+	})
+}
+
+/**
+ * The include → credits → stop gate for compute that has no daily counter:
+ * hosted package app requests and realtime hooks. Counted entry points get
+ * the same check inside {@link consumeDailyEntitlement}.
+ */
+export async function assertWithinComputeInclude(input: {
+	db: D1Database
+	userId: string
+	now?: Date
+}) {
+	const entitlement = await getCachedUserEntitlement(input.db, {
+		userId: input.userId,
+		email: null,
+	})
+	await assertWithinPastIncludeCredits({
+		db: input.db,
+		userId: input.userId,
+		entitlement,
+		now: input.now ?? new Date(),
+	})
 }
 
 export type RefundDailyEntitlementInput = {
