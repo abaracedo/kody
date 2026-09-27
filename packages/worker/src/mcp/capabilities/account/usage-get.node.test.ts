@@ -32,6 +32,7 @@ function createUsageTestDb(input: {
 	stripeCustomerId?: string | null
 	packageCount?: number
 	uniqueWorkerDays?: number
+	durableObjectRowsRead?: number
 }) {
 	const stableUserId = testStableUserIdFromEmail(input.email)
 	return {
@@ -83,6 +84,12 @@ function createUsageTestDb(input: {
 											event_count: input.uniqueWorkerDays,
 										})
 									}
+									if ((input.durableObjectRowsRead ?? 0) > 0) {
+										results.push({
+											metric: 'durable_object_rows_read',
+											event_count: input.durableObjectRowsRead,
+										})
+									}
 									return { results }
 								}
 								return { results: [] }
@@ -124,14 +131,22 @@ test('usageGet returns self-scoped entitlement snapshot', async () => {
 
 	const result = await usageGetCapability.handler({}, { env, callerContext })
 	expect(result.plan).toBe('pro')
-	const uniqueWorkerDays = result.resources.find(
+	const workerCompute = result.resources.find(
 		(row) => row.resource === 'unique_worker_days',
 	)
-	expect(uniqueWorkerDays?.label).toBe('Unique worker days')
-	expect(uniqueWorkerDays?.group).toBe('monthly')
-	expect(uniqueWorkerDays?.current).toBe(0)
-	expect(uniqueWorkerDays?.limit).toBe(2_000)
-	expect(uniqueWorkerDays?.overEightyPercent).toBe(false)
+	expect(workerCompute?.label).toBe('Worker compute')
+	expect(workerCompute?.group).toBe('monthly')
+	expect(workerCompute?.current).toBe(0)
+	expect(workerCompute?.limit).toBe(2_000)
+	expect(workerCompute?.overEightyPercent).toBe(false)
+	const rowsRead = result.resources.find(
+		(row) => row.resource === 'durable_object_rows_read',
+	)
+	expect(rowsRead?.label).toBe('Rows read')
+	expect(rowsRead?.group).toBe('monthly')
+	expect(rowsRead?.current).toBe(0)
+	expect(rowsRead?.limit).toBe(20_000_000_000)
+	expect(rowsRead?.overEightyPercent).toBe(false)
 	const saved = result.resources.find(
 		(row) => row.resource === 'saved_packages',
 	)
@@ -175,8 +190,8 @@ test('usageGet reports legacy Standard ceilings for grandfathered accounts', asy
 	expect(result.weekStart).toMatch(/^\d{4}-\d{2}-\d{2}$/)
 })
 
-test('usageGet warns on unique worker days with whatCounts and howToReduce', async () => {
-	const email = 'uwd-usage-get@example.com'
+test('usageGet warns on Worker compute with whatCounts and howToReduce', async () => {
+	const email = 'worker-compute-usage-get@example.com'
 	const userId = testStableUserIdFromEmail(email)
 	const { db } = createUsageTestDb({
 		email,
@@ -186,17 +201,19 @@ test('usageGet warns on unique worker days with whatCounts and howToReduce', asy
 	const env = withUsageEnv({ APP_DB: db }) as Env
 	const callerContext = createMcpCallerContext({
 		baseUrl: 'https://example.com',
-		user: { userId, email, displayName: 'Uwd' },
+		user: { userId, email, displayName: 'WorkerCompute' },
 	})
 
 	const result = await usageGetCapability.handler({}, { env, callerContext })
-	const uniqueWorkerDays = result.resources.find(
+	const workerCompute = result.resources.find(
 		(row) => row.resource === 'unique_worker_days',
 	)
-	expect(uniqueWorkerDays?.current).toBe(50)
-	expect(uniqueWorkerDays?.limit).toBe(50)
-	expect(uniqueWorkerDays?.percent).toBe(1)
-	expect(uniqueWorkerDays?.overEightyPercent).toBe(true)
+	expect(workerCompute?.label).toBe('Worker compute')
+	expect(workerCompute?.current).toBe(50)
+	expect(workerCompute?.limit).toBe(50)
+	expect(workerCompute?.percent).toBe(1)
+	expect(workerCompute?.overEightyPercent).toBe(true)
+	expect(workerCompute?.whatCounts).not.toMatch(/unique worker day/i)
 	expect(
 		result.warnings.some((row) => row.resource === 'unique_worker_days'),
 	).toBe(true)

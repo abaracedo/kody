@@ -5,6 +5,7 @@ import {
 	computeOverageIncludePercent,
 	computeOverageResourceVisibility,
 	computeOverageWarningResourceLabels,
+	isCustomerFacingComputeMeter,
 	resolveComputeIncludeCreditsStatus,
 	type ComputeOverageWarningResource,
 } from '#universal/compute-overage.ts'
@@ -50,6 +51,7 @@ export async function readAccountComputeOverage(input: {
 		uniqueWorkerDays: usage.uniqueWorkerDays,
 		durableObjectRowsRead: usage.durableObjectRowsRead,
 	})
+	// Both debit meters are customer-facing (Worker compute + Rows read).
 	const meters = [
 		toComputeMeter({
 			resource: 'unique_worker_days',
@@ -65,7 +67,7 @@ export async function readAccountComputeOverage(input: {
 			plan: input.plan,
 			creditWallet: input.creditWallet,
 		}),
-	]
+	].filter((meter) => isCustomerFacingComputeMeter(meter.resource))
 	return {
 		meters,
 		creditWallet: input.creditWallet,

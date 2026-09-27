@@ -47,14 +47,25 @@ function overage(
 		meters: [
 			{
 				resource: 'unique_worker_days',
-				label: 'Unique worker days',
-				whatCounts: 'Counts distinct Dynamic Worker isolates.',
+				label: 'Worker compute',
+				whatCounts: 'Counts each distinct worker once per UTC day.',
 				howToReduce: 'Keep package code stable.',
 				current: 45,
 				include: 50,
 				percentOfLimit,
 				overEightyPercent: percentOfLimit >= 0.8,
 				creditsStatus: percentOfLimit >= 1 ? 'add_credits' : 'within_include',
+			},
+			{
+				resource: 'durable_object_rows_read',
+				label: 'Rows read',
+				whatCounts: 'SQLite rows read by Durable Object package storage.',
+				howToReduce: 'Read less from package storage.',
+				current: 450_000_000,
+				include: 500_000_000,
+				percentOfLimit: Math.min(percentOfLimit, 0.9),
+				overEightyPercent: percentOfLimit >= 0.8,
+				creditsStatus: 'within_include',
 			},
 		],
 		creditWallet: 'empty',
@@ -77,6 +88,7 @@ test('compute notice points capped accounts at credits, never at invoices', () =
 		true,
 	)
 	expect(emptyWallet).toMatchObject({
+		title: "Over this month's include",
 		tone: 'warn',
 		action: { label: 'Add credits', href: '/account/credits' },
 	})
@@ -91,6 +103,7 @@ test('compute notice points capped accounts at credits, never at invoices', () =
 		false,
 	)
 	expect(free).toMatchObject({
+		title: "Over this month's include",
 		body: 'Switch to Pro for a larger include and prepaid credits.',
 		action: { label: 'Switch to Pro', href: '/account/credits' },
 	})
@@ -107,9 +120,11 @@ test('compute notice points capped accounts at credits, never at invoices', () =
 	)
 	expect(funded).toMatchObject({ title: 'Using credits', action: null })
 	expect(funded?.body).toContain('$1.24')
+	expect(funded?.body).toContain("Usage above this month's include")
 
 	for (const notice of [approaching, emptyWallet, free, funded]) {
 		expect(notice?.body).not.toMatch(/invoice|billed|payment method|overage/i)
+		expect(notice?.body).not.toMatch(/unique worker day/i)
 	}
 
 	expect(
@@ -326,7 +341,7 @@ test('warnings panel title is Limit reached at 100% daily or weekly', () => {
 	).toBe('Limit reached')
 
 	const computeIncludeAtLimit = entitlement({
-		resource: 'unique_worker_days',
+		resource: 'durable_object_rows_read',
 		group: 'monthly',
 		percentOfLimit: 1,
 		overEightyPercent: true,

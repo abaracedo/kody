@@ -4,7 +4,6 @@ import { isFeatureFlagEnabled } from '#client/feature-flags.ts'
 import { reveal } from '#client/reveal.ts'
 import { type RouteLoaderResult } from '#client/route-loader.ts'
 import { jevSearchRerankFlagKey } from '#universal/feature-flags/registry.ts'
-import { creditDebitRates } from '#universal/credits.ts'
 import {
 	formatDurableObjectRowsRead,
 	formatMinJobInterval,
@@ -85,10 +84,6 @@ const limitGroups: ReadonlyArray<LimitGroup> = [
 			{
 				label: 'Automation invocations per day',
 				key: 'maxAutomationInvocationsPerDay',
-			},
-			{
-				label: 'Unique worker days per month',
-				key: 'maxUniqueWorkerDaysPerMonth',
 			},
 			{
 				label: 'Durable Object rows read per month',
@@ -270,10 +265,9 @@ export function PricingRoute(handle: Handle) {
 						Prepaid credits
 					</h3>
 					<p mix={css(limitsFootnoteCss)}>
-						Add credits on Pro to lift rate caps. Usage above the monthly
-						include debits {creditDebitRates.unique_worker_days.label} and{' '}
-						{creditDebitRates.durable_object_rows_read.label}. No overage
-						invoices.
+						Add credits on Pro to lift hard caps. Usage above the monthly
+						include debits prepaid credits (Worker compute and Rows read). No
+						overage invoices.
 					</p>
 					<p mix={css(limitsFootnoteCss)}>
 						Execute and outbound fetches are hard daily and weekly caps

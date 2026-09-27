@@ -1,11 +1,15 @@
 /**
- * Monthly unique-worker-day and Durable Object rows-read include math and
+ * Monthly worker-compute and Durable Object rows-read include math and
  * the credits guidance shown next to those meters. Includes live on
  * {@link resolvePlanLimits}; debit rates on `credits.ts`.
  *
  * Nobody is invoiced for usage above an include. A funded purchasable-Pro
  * wallet is debited for it (`billing/credit-debits.ts`); every other
  * account is not charged, bounded by its hard rate caps.
+ *
+ * Customer surfaces name these meters “Worker compute” and “Rows read”
+ * (never Cloudflare “unique worker day” / UWD jargon). Both meters that
+ * debit credits are customer-visible — never debit an invisible meter.
  */
 import {
 	creditDebitCostMicroUsd,
@@ -43,7 +47,7 @@ const computeIncludeCreditsStatuses = [
 export type ComputeIncludeCreditsStatus =
 	(typeof computeIncludeCreditsStatuses)[number]
 
-export const computeOverageWarningResources = [
+const computeOverageWarningResources = [
 	'unique_worker_days',
 	'durable_object_rows_read',
 ] as const satisfies ReadonlyArray<CreditDebitMeter>
@@ -51,17 +55,29 @@ export const computeOverageWarningResources = [
 export type ComputeOverageWarningResource =
 	(typeof computeOverageWarningResources)[number]
 
-export const computeOverageWarningResourceLabels = {
-	unique_worker_days: 'Unique worker days',
-	durable_object_rows_read: 'Durable Object rows read',
-} as const satisfies Record<ComputeOverageWarningResource, string>
-
 /**
- * Factual mechanic line for hot unique-worker-day entitlement/limit
- * payloads. Meter name plus what a unique worker day is — not a playbook.
+ * Monthly meters on `/account/usage`, `usageGet`, credits rates, and
+ * customer entitlement-warning emails. Pricing comparison tables still omit
+ * these (execute + hard caps lead); debit surfaces must show both so
+ * credits never move on an invisible meter.
  */
-export const uniqueWorkerDayMechanic =
-	'Meter unique_worker_days: one unique Dynamic Worker isolate (worker id) per UTC day.'
+export const customerFacingComputeOverageMeters = [
+	'unique_worker_days',
+	'durable_object_rows_read',
+] as const satisfies ReadonlyArray<ComputeOverageWarningResource>
+
+export function isCustomerFacingComputeMeter(
+	resource: string,
+): resource is (typeof customerFacingComputeOverageMeters)[number] {
+	return (customerFacingComputeOverageMeters as ReadonlyArray<string>).includes(
+		resource,
+	)
+}
+
+export const computeOverageWarningResourceLabels = {
+	unique_worker_days: 'Worker compute',
+	durable_object_rows_read: 'Rows read',
+} as const satisfies Record<ComputeOverageWarningResource, string>
 
 export type ComputeOverageResourceVisibility = {
 	group: 'monthly'
@@ -72,16 +88,17 @@ export type ComputeOverageResourceVisibility = {
 
 /**
  * Plain-language copy for account usage UI, `usageGet`, warning emails,
- * and compute-include denials. Keep factual and terse.
+ * and compute-include denials. Keep factual and terse. Avoid Cloudflare
+ * “unique worker day” / UWD jargon on customer surfaces.
  */
 export const computeOverageResourceVisibility = {
 	unique_worker_days: {
 		group: 'monthly',
 		kind: 'counter',
 		whatCounts:
-			'Counts distinct Cloudflare Dynamic Worker isolates (worker id + code) that run on a given UTC day, rolled up for the month. Reusing the same warm isolate typically does not add another day.',
+			'Counts each distinct worker used for your account once per UTC day, rolled up for the month. Reusing the same worker on the same UTC day does not add another unit.',
 		howToReduce:
-			'Keep package code stable so isolates stay warm. For ad hoc execute, reuse the same module graph and vary args via params. Consolidate one-off execute runs into saved packages or jobs.',
+			'Keep package code stable so the same worker stays warm. For ad hoc execute, reuse the same module graph and vary args via params. Consolidate one-off execute runs into saved packages or jobs.',
 	},
 	durable_object_rows_read: {
 		group: 'monthly',

@@ -88,10 +88,11 @@ test('renderAppPage renders the redesigned pricing page', async () => {
 		'More room for jobs, workflows, and daily volume. Add prepaid credits to lift rate caps.',
 	)
 	expect(html).toContain('Prepaid credits')
-	expect(html).toContain('$0.004 per unique worker day')
+	expect(html).toContain(
+		'Usage above the monthly include debits prepaid credits (Worker compute and Rows read)',
+	)
 	expect(html).toContain('Teams / Enterprise')
 	expect(html).toContain('mailto:kody@kody.codes')
-	expect(html).toContain('Unique worker days per month')
 	expect(html).toContain('Durable Object rows read per month')
 	expect(html).toContain('Execute calls per week')
 	expect(html).toContain('Outbound fetches per week')
