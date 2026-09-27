@@ -1,5 +1,11 @@
 import { getErrorMessage } from '@kody-internal/shared/error-message.ts'
 import {
+	createPackageInvocationClientDisconnectedError,
+	isCallerDisconnectAbort,
+	packageInvocationClientDisconnectedErrorName,
+	packageInvocationStartedLog,
+} from '#worker/caller-disconnect.ts'
+import {
 	claimPackageInvocationRecord,
 	finishPackageInvocationRecord,
 	getPackageInvocationRecord,
@@ -286,6 +292,71 @@ export async function invokeSavedPackageModule(input: {
 		claimUpdatedAt: claim.claimUpdatedAt,
 		handle: claim.handle,
 	}
+	const startedLog = packageInvocationStartedLog(claimed.handle?.context.name)
+	let disconnectFinishSucceeded = false
+	let disconnectResponse: ReturnType<typeof buildJsonErrorResponse> | null =
+		null
+	let disconnectFinish: Promise<void> | null = null
+	const finishForCallerDisconnect = () => {
+		const signal = input.signal
+		if (!signal || !isCallerDisconnectAbort(signal)) return
+		if (disconnectFinish || disconnectFinishSucceeded) return
+		const error = createPackageInvocationClientDisconnectedError()
+		disconnectResponse = buildJsonErrorResponse({
+			status: 408,
+			code: packageInvocationClientDisconnectedErrorName,
+			message: error.message,
+			idempotencyKey: input.idempotencyKey,
+		})
+		const pending = finishPackageInvocationRecord({
+			env: input.env,
+			userId: input.actor.userId,
+			handle: claimed.handle,
+			invocationId: claimed.invocationId,
+			claimUpdatedAt: claimed.claimUpdatedAt,
+			ledgerStatus: 'failed',
+			responseJson: boundedResponseJson(disconnectResponse),
+			status: 'error',
+			logs: [startedLog],
+			error,
+			waitUntil: input.waitUntil,
+		}).then(
+			() => {
+				disconnectFinishSucceeded = true
+			},
+			(finishError: unknown) => {
+				console.warn(
+					'package invocation disconnect finish failed',
+					getErrorMessage(finishError),
+				)
+				// Allow the settled sandbox outcome to attempt a normal fenced
+				// finish so a transient DO write failure does not leave the key
+				// in_progress after the caller already disconnected.
+				disconnectFinish = null
+			},
+		)
+		disconnectFinish = pending
+		input.waitUntil?.(pending)
+	}
+	const onCallerDisconnect = () => {
+		finishForCallerDisconnect()
+	}
+	if (input.signal) {
+		if (input.signal.aborted) onCallerDisconnect()
+		else {
+			input.signal.addEventListener('abort', onCallerDisconnect, {
+				once: true,
+			})
+		}
+	}
+	if (disconnectFinishSucceeded) {
+		if (disconnectResponse) return disconnectResponse
+	} else if (disconnectFinish) {
+		await disconnectFinish
+		if (disconnectFinishSucceeded && disconnectResponse) {
+			return disconnectResponse
+		}
+	}
 	const outcome = await runSavedPackageModuleOnce({
 		env: input.env,
 		baseUrl: input.baseUrl,
@@ -307,6 +378,15 @@ export async function invokeSavedPackageModule(input: {
 		signal: input.signal,
 		externalRunRecordHandle: claimed.handle,
 	})
+	input.signal?.removeEventListener('abort', onCallerDisconnect)
+	if (disconnectFinish) {
+		await disconnectFinish
+	}
+	if (disconnectFinishSucceeded && disconnectResponse) {
+		return disconnectResponse
+	}
+	const logsWithStartedLine = (logs: Array<string>) =>
+		logs.includes(startedLog) ? logs : [startedLog, ...logs]
 	switch (outcome.kind) {
 		case 'artifact-unavailable':
 		case 'pre-execution-denied': {
@@ -384,7 +464,7 @@ export async function invokeSavedPackageModule(input: {
 					ledgerStatus: 'failed',
 					responseJson: boundedResponseJson(outcome.response),
 					status: 'error',
-					logs: outcome.logs,
+					logs: logsWithStartedLine(outcome.logs),
 					error: outcome.error,
 					waitUntil: input.waitUntil,
 				})

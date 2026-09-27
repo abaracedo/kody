@@ -3,7 +3,10 @@ import {
 	AccountSuspendedError,
 	accountSuspendedMessage,
 } from '#worker/account/account-suspension.ts'
-import { consoleError } from '#worker/test-support/console-spies.ts'
+import {
+	consoleError,
+	consoleWarn,
+} from '#worker/test-support/console-spies.ts'
 import { invokePackageExport, invokePackageSubscription } from './service.ts'
 import { clearInvokeContractCachesForTests } from './invoke-contract-cache.ts'
 import { maxStoredInvocationResponseJsonBytes } from './repo.ts'
@@ -1335,4 +1338,183 @@ test('invokePackageSubscription uses the normal capability registry with package
 		source: 'email',
 	})
 	expect(recoveredTransient.status).toBe(200)
+})
+
+test('caller disconnect finishes a keyed package invocation instead of leaving it running', async () => {
+	const db = createDatabase()
+	seedPackageResolution()
+	const controller = new AbortController()
+	let sawStartedLogWhileRunning = false
+	let sandboxEntered = false
+	repoMockModule.runBundledModuleWithRegistry.mockImplementation(
+		async (
+			_env: unknown,
+			_caller: unknown,
+			_bundle: unknown,
+			_params: unknown,
+			options: { signal?: AbortSignal } | undefined,
+		) => {
+			sandboxEntered = true
+			sawStartedLogWhileRunning = [...db.runLog.runLogs.values()]
+				.flat()
+				.some((message) => message.startsWith('package invocation started:'))
+			const signal = options?.signal
+			await new Promise((_resolve, reject) => {
+				if (!signal) {
+					reject(new Error('expected the caller abort signal'))
+					return
+				}
+				if (signal.aborted) {
+					reject(signal.reason)
+					return
+				}
+				signal.addEventListener('abort', () => reject(signal.reason), {
+					once: true,
+				})
+			})
+			return { result: { late: true }, logs: ['should-not-win'] }
+		},
+	)
+
+	const request = {
+		packageIdOrKodyId: 'discord-gateway',
+		exportName: 'dispatch-message-created',
+		params: { content: 'hi' },
+		idempotencyKey: 'audit-listupcoming',
+	}
+	const pending = invokePackageExport({
+		env: createEnv(db),
+		baseUrl: 'https://kody.dev',
+		token: createToken({}),
+		request,
+		signal: controller.signal,
+	})
+	await vi.waitFor(() => {
+		expect(sandboxEntered).toBe(true)
+	})
+	controller.abort()
+	const response = await pending
+
+	expect(sawStartedLogWhileRunning).toBe(true)
+	expect(response.status).toBe(408)
+	expect(response.body).toMatchObject({
+		ok: false,
+		error: {
+			code: 'client_disconnected',
+		},
+		idempotency: {
+			key: 'audit-listupcoming',
+			replayed: false,
+		},
+	})
+	expect(
+		[...db.runLog.runLogs.values()].some((lines) =>
+			lines.some((line) => line.startsWith('package invocation started:')),
+		),
+	).toBe(true)
+	expect(
+		[...db.runLog.runRows.values()].some(
+			(row) =>
+				row['status'] === 'error' && row['errorName'] === 'client_disconnected',
+		),
+	).toBe(true)
+	expect(repoMockModule.runBundledModuleWithRegistry).toHaveBeenCalledTimes(1)
+
+	const replay = await invokePackageExport({
+		env: createEnv(db),
+		baseUrl: 'https://kody.dev',
+		token: createToken({}),
+		request,
+	})
+	expect(replay.status).toBe(408)
+	expect(replay.body).toMatchObject({
+		ok: false,
+		error: { code: 'client_disconnected' },
+		idempotency: { key: 'audit-listupcoming', replayed: true },
+	})
+	expect(repoMockModule.runBundledModuleWithRegistry).toHaveBeenCalledTimes(1)
+})
+
+test('disconnect finish failure still allows a terminal ledger finish', async () => {
+	consoleWarn.mockImplementation(() => {})
+	const db = createDatabase()
+	seedPackageResolution()
+	const controller = new AbortController()
+	let sandboxEntered = false
+	const runRecords = await import('#worker/run-records/service.ts')
+	const realFinish = runRecords.finishPackageInvocationRecord
+	const finishSpy = vi
+		.spyOn(runRecords, 'finishPackageInvocationRecord')
+		.mockImplementationOnce(async () => {
+			throw new Error('transient disconnect finish failure')
+		})
+		.mockImplementation((...args) => realFinish(...args))
+	repoMockModule.runBundledModuleWithRegistry.mockImplementation(
+		async (
+			_env: unknown,
+			_caller: unknown,
+			_bundle: unknown,
+			_params: unknown,
+			options: { signal?: AbortSignal } | undefined,
+		) => {
+			sandboxEntered = true
+			const signal = options?.signal
+			await new Promise((_resolve, reject) => {
+				if (!signal) {
+					reject(new Error('expected the caller abort signal'))
+					return
+				}
+				if (signal.aborted) {
+					reject(signal.reason)
+					return
+				}
+				signal.addEventListener('abort', () => reject(signal.reason), {
+					once: true,
+				})
+			})
+			return { result: { late: true }, logs: ['sandbox late'] }
+		},
+	)
+
+	const request = {
+		packageIdOrKodyId: 'discord-gateway',
+		exportName: 'dispatch-message-created',
+		params: { content: 'hi' },
+		idempotencyKey: 'disconnect-finish-fail',
+	}
+	try {
+		const pending = invokePackageExport({
+			env: createEnv(db),
+			baseUrl: 'https://kody.dev',
+			token: createToken({}),
+			request,
+			signal: controller.signal,
+		})
+		await vi.waitFor(() => {
+			expect(sandboxEntered).toBe(true)
+		})
+		controller.abort()
+		const response = await pending
+		expect(response.status).not.toBe(408)
+		expect(
+			[...db.runLog.runRows.values()].some(
+				(row) => row['status'] === 'error' || row['status'] === 'success',
+			),
+		).toBe(true)
+		expect(
+			db.runLog.ledgerRows.some(
+				(row) =>
+					row.idempotencyKey === 'disconnect-finish-fail' &&
+					row.status !== 'in_progress',
+			),
+		).toBe(true)
+		expect(finishSpy.mock.calls.length).toBeGreaterThanOrEqual(2)
+		expect(consoleWarn).toHaveBeenCalledWith(
+			'package invocation disconnect finish failed',
+			'transient disconnect finish failure',
+		)
+	} finally {
+		finishSpy.mockRestore()
+		consoleWarn.mockReset()
+	}
 })

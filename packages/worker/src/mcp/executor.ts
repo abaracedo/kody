@@ -89,6 +89,12 @@ import {
 	executorSandboxTimeoutMessagePrefix,
 	isExecutorSandboxTimeoutMessage,
 } from '#worker/sentry-options.ts'
+import {
+	callerDisconnectedSandboxLog,
+	callerDisconnectedSandboxMessage,
+	createCallerDisconnectedExecutionError,
+	isCallerDisconnectedSandboxMessage,
+} from '#worker/caller-disconnect.ts'
 import { parseStorageEstimateReadErrorMessage } from '#worker/storage-estimate-error.ts'
 import {
 	kodyCallDispatcherName,
@@ -332,11 +338,14 @@ export async function raceWithHostEvaluationDeadline<T>(
 	}
 	const onExternalAbort = () => {
 		const reason = externalSignal?.reason
-		abortWith(
-			reason instanceof Error
-				? reason
-				: new Error(executorSandboxTimeoutMessage),
-		)
+		// A caller disconnect must not be relabeled as the sandbox wall-clock
+		// timeout. Only a real Error reason (AbortError, or an upstream
+		// timeout) is forwarded; a bare abort is the inbound request ending.
+		if (reason instanceof Error) {
+			abortWith(reason)
+			return
+		}
+		abortWith(new DOMException(callerDisconnectedSandboxMessage, 'AbortError'))
 	}
 	const timeoutPromise = new Promise<never>((_resolve, reject) => {
 		rejectDeadline = reject
@@ -415,6 +424,9 @@ async function settleWithin<T>(
 
 export function createNamedExecutionError(error: unknown) {
 	const message = getErrorMessage(error)
+	if (isCallerDisconnectedSandboxMessage(message)) {
+		return createCallerDisconnectedExecutionError()
+	}
 	const namedError = new Error(message)
 	if (isExecutorSandboxTimeoutMessage(message)) {
 		namedError.name = 'TimeoutError'
@@ -741,6 +753,17 @@ function createStableDynamicWorkerExecutor(input: DynamicWorkerExecutorInput) {
 								result: undefined,
 								error: drainedResponse?.error ?? message,
 								logs: drainedResponse?.logs ?? [],
+							},
+							sideEffects,
+						)
+					}
+					if (error instanceof Error && error.name === 'AbortError') {
+						outcome = 'error'
+						return attachHostSideEffects(
+							{
+								result: undefined,
+								error: callerDisconnectedSandboxMessage,
+								logs: [callerDisconnectedSandboxLog],
 							},
 							sideEffects,
 						)
