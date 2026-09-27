@@ -12,6 +12,10 @@ import {
 import { type ContentBlock } from '@modelcontextprotocol/sdk/types.js'
 import { exports as workerExports } from 'cloudflare:workers'
 import {
+	dynamicWorkerUsageTailLoaderIdSuffix,
+	type DynamicWorkerUsageTailProps,
+} from '#worker/usage/dynamic-worker-cpu.ts'
+import {
 	outboundFetchTimeoutMsForExecutor,
 	retrieverOutboundFetchDeniedMessage,
 	type FetchGatewayProps,
@@ -173,6 +177,12 @@ type DynamicWorkerExecutorInput = {
 	timeout: number
 	signal?: AbortSignal
 	globalOutbound: Fetcher | null
+	/**
+	 * Builds the tail worker that records Cloudflare-measured CPU for this
+	 * isolate (`dynamic_worker_cpu`). Omitted when the loopback export is not
+	 * available; the run is unaffected either way.
+	 */
+	createUsageTail?: (props: DynamicWorkerUsageTailProps) => Fetcher
 	modules?: WorkerLoaderModules
 	gatewayProps: FetchGatewayProps
 	usageEnv: UsageEnv & UserMeterEnv
@@ -582,6 +592,12 @@ export function createExecuteExecutor(input: {
 		globalOutbound: loopbackExports.KodyFetchGateway({
 			props: gatewayProps,
 		}),
+		...(loopbackExports.DynamicWorkerUsageTail
+			? {
+					createUsageTail: (props: DynamicWorkerUsageTailProps) =>
+						loopbackExports.DynamicWorkerUsageTail({ props }),
+				}
+			: {}),
 		modules: input.modules,
 		gatewayProps,
 		usageEnv: input.env,
@@ -660,8 +676,24 @@ function createStableDynamicWorkerExecutor(input: DynamicWorkerExecutorInput) {
 			const startedAtMs = Date.now()
 			let outcome: 'success' | 'error' = 'success'
 			try {
+				const usageUserId = input.gatewayProps.userId
+				const usageTail =
+					usageUserId && input.createUsageTail
+						? input.createUsageTail({ userId: usageUserId, workerId })
+						: null
+				// LOADER.get keeps the first WorkerCode cached for an id, so an
+				// isolate loaded without a tail would never gain one under the
+				// same id. Tailed isolates get their own cache id; metering keeps
+				// `workerId`.
+				const loaderId = usageTail
+					? `${workerId}${dynamicWorkerUsageTailLoaderIdSuffix}`
+					: workerId
 				const entrypoint = input.loader
-					.get(workerId, () => workerOptions)
+					.get(loaderId, () =>
+						usageTail
+							? { ...workerOptions, tails: [usageTail] }
+							: workerOptions,
+					)
 					.getEntrypoint() as unknown as DynamicWorkerEntrypoint
 				let response: Awaited<ReturnType<DynamicWorkerEntrypoint['evaluate']>>
 				try {
