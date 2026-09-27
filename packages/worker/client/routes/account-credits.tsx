@@ -19,6 +19,7 @@ import {
 	AccountManagementShell,
 	AccountPageHeader,
 } from '#client/routes/account-management-components.tsx'
+import { renderCreditsDebitRateCard } from '#client/routes/account-credits-rate-card.tsx'
 import { RecordTable } from '#client/routes/record-table.tsx'
 import { requestProCheckout } from '#client/routes/billing-checkout.ts'
 import {
@@ -630,11 +631,9 @@ export function AccountCreditsRoute(handle: Handle) {
 							},
 						}))}
 					/>
-					<p mix={css(accountFieldNoteCss)}>
-						Above your monthly include:{' '}
-						{credits.rates.map((rate) => rate.label).join(' · ')}.
-					</p>
 				</AccountManagementPanel>
+
+				{renderCreditsDebitRateCard(credits.debitMeters)}
 
 				<AccountManagementPanel title="Recent">
 					{credits.recent.length === 0 ? (
