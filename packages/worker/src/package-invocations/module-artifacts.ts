@@ -49,15 +49,20 @@ export async function resolveSavedPackage(input: {
 	return await resolveSavedPackageWithFreshnessCache({
 		userId: input.userId,
 		packageIdOrKodyId: input.packageIdOrKodyId,
-		load: async () =>
-			(await getSavedPackageById(input.db, {
-				userId: input.userId,
-				packageId: input.packageIdOrKodyId,
-			})) ??
-			(await getSavedPackageByKodyId(input.db, {
+		load: async () => {
+			const byKodyId = getSavedPackageByKodyId(input.db, {
 				userId: input.userId,
 				kodyId: input.packageIdOrKodyId,
-			})),
+			})
+			// Only surfaces when the id lookup misses and awaits it below.
+			byKodyId.catch(() => {})
+			return (
+				(await getSavedPackageById(input.db, {
+					userId: input.userId,
+					packageId: input.packageIdOrKodyId,
+				})) ?? (await byKodyId)
+			)
+		},
 	})
 }
 

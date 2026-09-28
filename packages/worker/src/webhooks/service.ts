@@ -201,22 +201,28 @@ export async function listWebhooksForUser(input: {
 		mintedByKey.set(`${mint.packageId}:${mint.webhookName}`, mint)
 	}
 
+	const manifests = await Promise.all(
+		filteredPackages.map((savedPackage) =>
+			loadPackageManifestBySourceId({
+				env: input.env,
+				baseUrl: input.baseUrl,
+				userId: input.userId,
+				sourceId: savedPackage.sourceId,
+			}).catch((error) => {
+				console.warn('Failed to load package manifest for webhooks', {
+					packageId: savedPackage.id,
+					sourceId: savedPackage.sourceId,
+					error,
+				})
+				return null
+			}),
+		),
+	)
+
 	const listed: Array<ListedWebhook> = []
 	const urlHost = webhookUrlHostFromOrigin(input.baseUrl)
-	for (const savedPackage of filteredPackages) {
-		const loaded = await loadPackageManifestBySourceId({
-			env: input.env,
-			baseUrl: input.baseUrl,
-			userId: input.userId,
-			sourceId: savedPackage.sourceId,
-		}).catch((error) => {
-			console.warn('Failed to load package manifest for webhooks', {
-				packageId: savedPackage.id,
-				sourceId: savedPackage.sourceId,
-				error,
-			})
-			return null
-		})
+	for (const [index, savedPackage] of filteredPackages.entries()) {
+		const loaded = manifests[index]
 		if (!loaded) continue
 		for (const webhook of listPackageWebhooks(loaded.manifest)) {
 			const mint = mintedByKey.get(`${savedPackage.id}:${webhook.name}`)

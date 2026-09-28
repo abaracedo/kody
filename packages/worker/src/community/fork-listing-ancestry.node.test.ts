@@ -1,4 +1,4 @@
-import { expect, test, vi } from 'vitest'
+import { beforeEach, expect, test, vi } from 'vitest'
 import { listingPinIsAncestorOfForkTip } from './fork-listing-ancestry.ts'
 
 const mocks = vi.hoisted(() => ({
@@ -31,6 +31,11 @@ vi.mock('#worker/repo/artifacts.ts', () => ({
 	resolveExistingArtifactSourceRepo: (...args: Array<unknown>) =>
 		mocks.resolveExistingArtifactSourceRepo(...args),
 }))
+
+// Answers are cached per isolate, so each case uses its own repo id.
+beforeEach(() => {
+	vi.clearAllMocks()
+})
 
 function readyRepo() {
 	return {
@@ -91,7 +96,7 @@ test('listing pin ancestry walks the origin absorb marker and treats missing his
 	expect(
 		await listingPinIsAncestorOfForkTip({
 			env: {} as Env,
-			repoId: 'repo-1',
+			repoId: 'repo-loopback',
 			listingPinnedCommit: 'commit-pin',
 			forkTip: 'commit-tip',
 		}),
@@ -106,4 +111,45 @@ test('listing pin ancestry walks the origin absorb marker and treats missing his
 			forkTip: 'commit-tip',
 		}),
 	).toBe(null)
+})
+
+test('listing pin ancestry reuses definite answers without refetching the origin graph', async () => {
+	mocks.resolveExistingArtifactSourceRepo.mockResolvedValue(readyRepo())
+	mocks.log.mockResolvedValue([{ oid: 'commit-tip' }, { oid: 'commit-pin' }])
+	const input = {
+		env: {} as Env,
+		repoId: 'repo-reuse',
+		listingPinnedCommit: 'commit-pin',
+		forkTip: 'commit-tip',
+	}
+
+	const concurrent = await Promise.all([
+		listingPinIsAncestorOfForkTip(input),
+		listingPinIsAncestorOfForkTip(input),
+	])
+	expect(concurrent).toEqual([true, true])
+	expect(await listingPinIsAncestorOfForkTip(input)).toBe(true)
+	expect(mocks.fetch).toHaveBeenCalledTimes(1)
+
+	mocks.log.mockResolvedValue([{ oid: 'commit-tip' }])
+	const notAncestor = { ...input, listingPinnedCommit: 'commit-other' }
+	expect(await listingPinIsAncestorOfForkTip(notAncestor)).toBe(false)
+	expect(await listingPinIsAncestorOfForkTip(notAncestor)).toBe(false)
+	expect(mocks.fetch).toHaveBeenCalledTimes(2)
+})
+
+test('listing pin ancestry retries after an unreadable graph instead of caching null', async () => {
+	mocks.resolveExistingArtifactSourceRepo.mockResolvedValueOnce(null)
+	const input = {
+		env: {} as Env,
+		repoId: 'repo-flaky',
+		listingPinnedCommit: 'commit-pin',
+		forkTip: 'commit-tip',
+	}
+	expect(await listingPinIsAncestorOfForkTip(input)).toBe(null)
+
+	mocks.resolveExistingArtifactSourceRepo.mockResolvedValue(readyRepo())
+	mocks.log.mockResolvedValue([{ oid: 'commit-tip' }, { oid: 'commit-pin' }])
+	expect(await listingPinIsAncestorOfForkTip(input)).toBe(true)
+	expect(mocks.resolveExistingArtifactSourceRepo).toHaveBeenCalledTimes(2)
 })

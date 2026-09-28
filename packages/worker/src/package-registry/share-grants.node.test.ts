@@ -136,6 +136,68 @@ async function createHarness() {
 	return { db, ...seeded }
 }
 
+function countingDb(db: D1Database) {
+	const statements: Array<string> = []
+	const reads = { inFlight: 0, maxInFlight: 0 }
+	const counted = new Proxy(db, {
+		get(target, property, receiver) {
+			if (property === 'prepare') {
+				return (query: string) => {
+					statements.push(query.replace(/\s+/g, ' ').trim())
+					const statement = target.prepare(query)
+					return {
+						bind: (...values: Array<unknown>) => {
+							const bound = statement.bind(...values)
+							return {
+								async first<T>() {
+									reads.inFlight += 1
+									reads.maxInFlight = Math.max(
+										reads.maxInFlight,
+										reads.inFlight,
+									)
+									await new Promise((resolve) => setTimeout(resolve, 5))
+									reads.inFlight -= 1
+									return bound.first<T>()
+								},
+							}
+						},
+					}
+				}
+			}
+			return Reflect.get(target, property, receiver)
+		},
+	})
+	return { db: counted, statements, reads }
+}
+
+test('execute storage grant checks skip empty sets and verify ownership concurrently', async () => {
+	const { db, packageId } = await createHarness()
+	const second = await seedPublishedPackage(db, {
+		userId: ownerUserId,
+		name: '@alice/second',
+		kodyId: 'second',
+	})
+	const counting = countingDb(db)
+
+	await expect(
+		collectShareStorageOwners({
+			db: counting.db,
+			callerUserId: ownerUserId,
+			packageIds: [],
+		}),
+	).resolves.toEqual(new Map())
+	expect(counting.statements).toEqual([])
+
+	const retained = await retainAuthorizedPackageStorageGrantIds({
+		db: counting.db,
+		callerUserId: ownerUserId,
+		packageIds: [packageId, second.packageId, 'not-mine'],
+		storageOwnerByPackageId: new Map(),
+	})
+	expect(retained).toEqual(new Set([packageId, second.packageId]))
+	expect(counting.reads.maxInFlight).toBe(3)
+})
+
 test('invite fails closed when package-share-grants is off', async () => {
 	const sqlite = new DatabaseSync(':memory:')
 	applyRepositoryMigrations(sqlite, migrationsDirectory)
