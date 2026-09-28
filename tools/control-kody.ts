@@ -107,6 +107,8 @@ const usageLines = [
 	'',
 	'preview forwards its flags to preview:manual-test (--pr, --request, --check).',
 	'A `--` separator is optional. Example: preview --pr 42 --check /account',
+	"--request specs take request's --dump/--contains at the end, e.g.",
+	"  preview --pr 42 --request 'GET /pricing --dump --contains Worker compute'",
 	'',
 	'request spec is METHOD /path [status] [json-body]. Separate arguments',
 	'are joined, so POST /path 400 \'{"action":"add"}\' sends the body.',
