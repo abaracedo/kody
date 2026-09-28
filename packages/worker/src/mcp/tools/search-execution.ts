@@ -60,6 +60,13 @@ type ExecuteSearchListInput = {
 	memoryContext?: SearchToolArgs['memoryContext']
 	/** Optional capability domain id; scopes ranked results to that domain's capabilities. */
 	domain?: string
+	/**
+	 * Filled as each phase finishes, so a caller that abandons the search at
+	 * its deadline can still report which phases completed.
+	 */
+	phaseTimings?: Partial<SearchPhaseTimings>
+	/** Aborted when the caller's search deadline passes; later phases stop. */
+	signal?: AbortSignal
 }
 
 export async function executeSearchList(
@@ -84,7 +91,7 @@ async function executeSearchListWithinBudget(
 		email: input.callerContext.user?.email ?? null,
 	})
 	const domainFilter = input.domain?.trim() || undefined
-	const phaseTimings: Partial<SearchPhaseTimings> = {}
+	const phaseTimings: Partial<SearchPhaseTimings> = input.phaseTimings ?? {}
 	const usernameStart = performance.now()
 	const username = await resolvePublicUsername({
 		db: input.env.APP_DB,
@@ -228,6 +235,7 @@ async function executeSearchListWithinBudget(
 					return retrieverRun
 				})
 	const [searchRows] = await Promise.all([rowsPromise, retrieverRunPromise])
+	input.signal?.throwIfAborted()
 	warnings = searchRows.warnings
 	const retrieverRun = await retrieverRunPromise
 	warnings.push(...retrieverRun.warnings)
@@ -264,7 +272,9 @@ async function executeSearchListWithinBudget(
 			: {}),
 		...(jevRerankEnabled ? { jevRerankEnabled: true } : {}),
 		...(jevRerankPlanEligible ? { jevRerankPlanEligible: true } : {}),
+		...(input.signal ? { signal: input.signal } : {}),
 	})
+	input.signal?.throwIfAborted()
 	phaseTimings.searchUnifiedMs = elapsedMs(searchUnifiedStart)
 	// Only ranked-path results include jevRerank telemetry. Domain index /
 	// overview / empty-query short-circuits stay outside the experiment frame.
